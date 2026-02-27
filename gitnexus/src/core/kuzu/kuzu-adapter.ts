@@ -15,11 +15,63 @@ import { streamAllCSVsToDisk } from './csv-generator.js';
 
 let db: kuzu.Database | null = null;
 let conn: kuzu.Connection | null = null;
+let currentDbPath: string | null = null;
+let ftsLoaded = false;
+
+// Global session lock for operations that touch module-level kuzu globals.
+// This guarantees no DB switch can happen while an operation is running.
+let sessionLock: Promise<void> = Promise.resolve();
+
+const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+  const previous = sessionLock;
+  let release: (() => void) | null = null;
+  sessionLock = new Promise<void>(resolve => {
+    release = resolve;
+  });
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release?.();
+  }
+};
 
 const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
 
 export const initKuzu = async (dbPath: string) => {
-  if (conn) return { db, conn };
+  return runWithSessionLock(() => ensureKuzuInitialized(dbPath));
+};
+
+/**
+ * Execute multiple queries against one repo DB atomically.
+ * While the callback runs, no other request can switch the active DB.
+ */
+export const withKuzuDb = async <T>(dbPath: string, operation: () => Promise<T>): Promise<T> => {
+  return runWithSessionLock(async () => {
+    await ensureKuzuInitialized(dbPath);
+    return operation();
+  });
+};
+
+const ensureKuzuInitialized = async (dbPath: string) => {
+  if (conn && currentDbPath === dbPath) {
+    return { db, conn };
+  }
+  await doInitKuzu(dbPath);
+  return { db, conn };
+};
+
+const doInitKuzu = async (dbPath: string) => {
+  // Different database requested — close the old one first
+  if (conn || db) {
+    try { if (conn) await conn.close(); } catch {}
+    try { if (db) await db.close(); } catch {}
+    conn = null;
+    db = null;
+    currentDbPath = null;
+    ftsLoaded = false;
+  }
 
   // kuzu v0.11 stores the database as a single file (not a directory).
   // If the path already exists, it must be a valid kuzu database file.
@@ -60,6 +112,7 @@ export const initKuzu = async (dbPath: string) => {
     }
   }
 
+  currentDbPath = dbPath;
   return { db, conn };
 };
 
@@ -277,10 +330,10 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   }
   // TypeScript/JS code element tables have isExported; multi-language tables do not
   if (TABLES_WITH_EXPORTED.has(table)) {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   // Multi-language tables (Struct, Impl, Trait, Macro, etc.)
-  return `COPY ${t}(id, name, filePath, startLine, endLine, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  return `COPY ${t}(id, name, filePath, startLine, endLine, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
 };
 
 /**
@@ -317,10 +370,12 @@ export const insertNodeToKuzu = async (
     } else if (label === 'Folder') {
       query = `CREATE (n:Folder {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
-      query = `CREATE (n:${t} {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${escapeValue(properties.content || '')}})`;
+      const descPart = properties.description ? `, description: ${escapeValue(properties.description)}` : '';
+      query = `CREATE (n:${t} {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${escapeValue(properties.content || '')}${descPart}})`;
     } else {
       // Multi-language tables (Struct, Impl, Trait, Macro, etc.) — no isExported
-      query = `CREATE (n:${t} {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, content: ${escapeValue(properties.content || '')}})`;
+      const descPart = properties.description ? `, description: ${escapeValue(properties.description)}` : '';
+      query = `CREATE (n:${t} {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, content: ${escapeValue(properties.content || '')}${descPart}})`;
     }
     
     // Use per-query connection if dbPath provided (avoids lock conflicts)
@@ -386,9 +441,11 @@ export const batchInsertNodesToKuzu = async (
         } else if (label === 'Folder') {
           query = `MERGE (n:Folder {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {
-          query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${escapeValue(properties.content || '')}`;
+          const descPart = properties.description ? `, n.description = ${escapeValue(properties.description)}` : '';
+          query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
         } else {
-          query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.content = ${escapeValue(properties.content || '')}`;
+          const descPart = properties.description ? `, n.description = ${escapeValue(properties.description)}` : '';
+          query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
         }
         
         await tempConn.query(query);
@@ -528,6 +585,7 @@ export const closeKuzu = async (): Promise<void> => {
     } catch {}
     db = null;
   }
+  currentDbPath = null;
   ftsLoaded = false;
 };
 
@@ -616,9 +674,8 @@ export const getEmbeddingTableName = (): string => EMBEDDING_TABLE_NAME;
 
 /**
  * Load the FTS extension (required before using FTS functions).
- * Safe to call multiple times — tracks loaded state.
+ * Safe to call multiple times — tracks loaded state via module-level ftsLoaded.
  */
-let ftsLoaded = false;
 export const loadFTSExtension = async (): Promise<void> => {
   if (ftsLoaded) return;
   if (!conn) {
